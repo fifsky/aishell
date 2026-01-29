@@ -27,10 +27,16 @@ brew install jq
 
 ### 1. 下载与授权
 
-确保脚本具有执行权限：
+使用 wget 下载脚本到本地（例如 `~/aishell.sh`）：
 
 ```bash
-chmod +x aishell.sh
+wget -O ~/aishell.sh https://raw.githubusercontent.com/fifsky/aishell/refs/heads/main/aishell.sh
+```
+
+赋予执行权限：
+
+```bash
+chmod +x ~/aishell.sh
 ```
 
 ### 2. 配置环境变量
@@ -52,7 +58,7 @@ export AISHELL_API_KEY="sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 # export AISHELL_MODEL="kimi-k2.5"
 
 # 选填：配置别名
-alias ai="${HOME}/aishell/aishell.sh"
+alias ai="${HOME}/aishell.sh"
 ```
 
 保存后，重载配置文件使生效：
