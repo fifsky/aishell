@@ -64,6 +64,42 @@ update_context() {
     echo "$new_context" > "$CONTEXT_FILE"
 }
 
+# 显示加载动画
+start_spinner() {
+    # 隐藏光标
+    printf "\033[?25l" >&2
+    (
+        local delay=0.08
+        local frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+        while :; do
+            for frame in "${frames[@]}"; do
+                printf "\r \033[36m%s\033[0m 正在思考中..." "$frame" >&2
+                sleep $delay
+            done
+        done
+    ) &
+    SPINNER_PID=$!
+}
+
+stop_spinner() {
+    if [ -n "$SPINNER_PID" ]; then
+        kill "$SPINNER_PID" >/dev/null 2>&1
+        wait "$SPINNER_PID" >/dev/null 2>&1
+        # 清除行并恢复光标
+        printf "\r%s\r" "                       " >&2
+        printf "\033[?25h" >&2
+        SPINNER_PID=""
+    fi
+}
+
+# 信号捕获：退出时恢复光标
+cleanup() {
+    stop_spinner
+    printf "\033[?25h" >&2
+    exit
+}
+trap cleanup SIGINT SIGTERM
+
 # 调用 API 获取回复
 # 参数: 上下文 JSON 内容
 call_api() {
@@ -77,7 +113,7 @@ call_api() {
         --arg enable_thinking "$ENABLE_THINKING" \
         '{model: $model, messages: $messages} + (if $enable_thinking == "false" then {thinking: {type: "disabled"}} else {} end)')
 
-    echo "正在思考中..." >&2
+    start_spinner
 
     # 调用 API
     local response
@@ -86,8 +122,11 @@ call_api() {
       -H "Content-Type: application/json" \
       -d "$request_data")
       
+    local curl_exit_code=$?
+    stop_spinner
+
     # 检查 curl 是否成功
-    if [ $? -ne 0 ]; then
+    if [ $curl_exit_code -ne 0 ]; then
         echo "错误: API 请求失败。" >&2
         exit 1
     fi
