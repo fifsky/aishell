@@ -4,6 +4,7 @@
 API_URL="${AISHELL_BASE_URL:-https://api.moonshot.cn/v1/chat/completions}"
 API_KEY="${AISHELL_API_KEY}"
 MODEL="${AISHELL_MODEL:-kimi-k2.5}"
+MAX_CONTEXT_SIZE="${AISHELL_MAX_CONTEXT:-100}"
 ENABLE_THINKING="false"
 CONTEXT_DIR="$HOME/.aishell"
 CONTEXT_FILE="$CONTEXT_DIR/context.json"
@@ -57,9 +58,17 @@ update_context() {
     
     current_context=$(cat "$CONTEXT_FILE")
     
-    # 使用 jq 将新消息追加到数组末尾
+    # 使用 jq 将新消息追加到数组末尾，并限制上下文长度
+    # 逻辑：总是保留第一条（系统提示词），如果超过限制，则保留最后 MAX_CONTEXT_SIZE - 1 条后续消息
     local new_context
-    new_context=$(echo "$current_context" | jq --arg role "$role" --arg content "$content" '. + [{"role": $role, "content": $content}]')
+    new_context=$(echo "$current_context" | jq --arg role "$role" --arg content "$content" --argjson max_len "$MAX_CONTEXT_SIZE" '
+        . + [{"role": $role, "content": $content}] |
+        if length > $max_len then
+            [.[0]] + (.[1:] | .[-(($max_len - 1)):])
+        else
+            .
+        end
+    ')
     
     echo "$new_context" > "$CONTEXT_FILE"
 }

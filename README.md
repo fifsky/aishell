@@ -57,6 +57,9 @@ export AISHELL_API_KEY="sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 # 选填：配置模型 (默认为 kimi-k2.5)
 # export AISHELL_MODEL="kimi-k2.5"
 
+# 选填：配置上下文保留条数 (默认为 100)
+# export AISHELL_MAX_CONTEXT=100
+
 # 选填：配置别名
 alias ai="${HOME}/aishell.sh"
 ```
