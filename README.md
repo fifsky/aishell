@@ -52,7 +52,7 @@ export AISHELL_API_KEY="sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 # export AISHELL_MODEL="kimi-k2.5"
 
 # 选填：配置别名
-alias ai="/Users/fifsky/wwwroot/aishell/aishell.sh"
+alias ai="${HOME}/aishell/aishell.sh"
 ```
 
 保存后，重载配置文件使生效：
