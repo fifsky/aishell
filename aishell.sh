@@ -6,8 +6,9 @@ API_KEY="${AISHELL_API_KEY}"
 MODEL="${AISHELL_MODEL:-kimi-k2.5}"
 MAX_CONTEXT_SIZE="${AISHELL_MAX_CONTEXT:-100}"
 ENABLE_THINKING="false"
-CONTEXT_DIR="$HOME/.aishell"
-CONTEXT_FILE="$CONTEXT_DIR/context.json"
+BASE_DIR="$HOME/.aishell"
+SESSION_DIR="$BASE_DIR/sessions"
+CONFIG_FILE="$BASE_DIR/config.json"
 SYSTEM_PROMPT="你是一个shell命令生成器，根据用户的需求生成对应的shell命令，不要输出其他内容"
 
 # 检查依赖
@@ -24,17 +25,140 @@ check_dependencies() {
     fi
 }
 
-# 初始化上下文
-init_context() {
-    # 确保上下文目录存在
-    if [ ! -d "$CONTEXT_DIR" ]; then
-        mkdir -p "$CONTEXT_DIR"
+# 初始化配置
+init_config() {
+    # 确保基础目录和会话目录存在
+    if [ ! -d "$SESSION_DIR" ]; then
+        mkdir -p "$SESSION_DIR"
     fi
 
+    # 初始化配置文件
+    if [ ! -f "$CONFIG_FILE" ]; then
+        jq -n '{"current_session": "default"}' > "$CONFIG_FILE"
+    fi
+}
+
+# 获取当前session名称
+get_current_session() {
+    local current_session
+    current_session=$(jq -r '.current_session // "default"' "$CONFIG_FILE")
+    echo "$current_session"
+}
+
+# 设置当前session
+set_session() {
+    local session_name="$1"
+    local temp_config
+    temp_config=$(jq --arg session "$session_name" '.current_session = $session' "$CONFIG_FILE")
+    echo "$temp_config" > "$CONFIG_FILE"
+}
+
+# 列出所有session
+list_sessions() {
+    if ! command -v fzf &> /dev/null; then
+        echo "错误: 未找到 fzf 命令。请先安装 fzf。"
+        echo "安装命令: brew install fzf"
+        exit 1
+    fi
+
+    local current_session
+    current_session=$(get_current_session)
+
+    # 获取所有session文件
+    local sessions=()
+    while IFS= read -r -d '' file; do
+        local session_name
+        session_name=$(basename "$file" .json)
+        sessions+=("$session_name")
+    done < <(find "$SESSION_DIR" -maxdepth 1 -type f -name "*.json" -print0 | sort -z)
+
+    if [ ${#sessions[@]} -eq 0 ]; then
+        echo "当前没有可用的session。"
+        exit 0
+    fi
+
+    # 使用fzf选择session，当前session用*标记
+    local selected_session
+    selected_session=$(printf "%s\n" "${sessions[@]}" | \
+        awk -v current="$current_session" '{if ($1 == current) print "* " $0; else print "  " $0}' | \
+        fzf --height 40% --reverse --prompt="选择session (当前: $current_session): " --ansi | \
+        sed 's/^[* ] //')
+
+    if [ -n "$selected_session" ]; then
+        set_session "$selected_session"
+        printf "已切换到session: \033[32m%s\033[0m\n" "$selected_session"
+    fi
+}
+
+# 删除session
+delete_session() {
+    if ! command -v fzf &> /dev/null; then
+        echo "错误: 未找到 fzf 命令。请先安装 fzf。"
+        echo "安装命令: brew install fzf"
+        exit 1
+    fi
+
+    local current_session
+    current_session=$(get_current_session)
+
+    # 获取所有session文件
+    local sessions=()
+    while IFS= read -r -d '' file; do
+        local session_name
+        session_name=$(basename "$file" .json)
+        sessions+=("$session_name")
+    done < <(find "$SESSION_DIR" -maxdepth 1 -type f -name "*.json" -print0 | sort -z)
+
+    if [ ${#sessions[@]} -eq 0 ]; then
+        echo "当前没有可用的session。"
+        exit 0
+    fi
+
+    # 使用fzf选择session，当前session用*标记
+    local selected_session
+    selected_session=$(printf "%s\n" "${sessions[@]}" | \
+        awk -v current="$current_session" '{if ($1 == current) print "* " $0; else print "  " $0}' | \
+        fzf --height 40% --reverse --prompt="选择要删除的session (当前: $current_session): " --ansi --multi | \
+        sed 's/^[* ] //')
+
+    if [ -z "$selected_session" ]; then
+        echo "已取消删除。"
+        exit 0
+    fi
+
+    # 支持多选删除
+    local deleted_count=0
+    while IFS= read -r session; do
+        local context_file="$SESSION_DIR/${session}.json"
+        if [ -f "$context_file" ]; then
+            rm -f "$context_file"
+            printf "已删除session: \033[31m%s\033[0m\n" "$session"
+            ((deleted_count++))
+
+            # 如果删除的是当前session，重置为default
+            if [ "$session" = "$current_session" ]; then
+                set_session "default"
+                init_context
+                printf "当前session已重置为: \033[32mdefault\033[0m\n"
+            fi
+        fi
+    done <<< "$selected_session"
+
+    if [ $deleted_count -eq 0 ]; then
+        echo "没有删除任何session。"
+    fi
+}
+
+# 初始化上下文
+init_context() {
+    local session_name
+    session_name=$(get_current_session)
+    local context_file="$SESSION_DIR/${session_name}.json"
+
     # 初始化上下文文件
-    if [ ! -f "$CONTEXT_FILE" ]; then
+    if [ ! -f "$context_file" ]; then
         # 如果文件不存在，创建一个包含系统提示词的初始 JSON 数组
-        jq -n --arg content "$SYSTEM_PROMPT" '[{"role": "system", "content": $content}]' > "$CONTEXT_FILE"
+        jq -n --arg content "$SYSTEM_PROMPT" '[{"role": "system", "content": $content}]' > "$context_file"
     fi
 }
 
@@ -54,10 +178,13 @@ get_user_input() {
 update_context() {
     local role="$1"
     local content="$2"
+    local session_name
+    session_name=$(get_current_session)
+    local context_file="$SESSION_DIR/${session_name}.json"
     local current_context
-    
-    current_context=$(cat "$CONTEXT_FILE")
-    
+
+    current_context=$(cat "$context_file")
+
     # 使用 jq 将新消息追加到数组末尾，并限制上下文长度
     # 逻辑：总是保留第一条（系统提示词），如果超过限制，则保留最后 MAX_CONTEXT_SIZE - 1 条后续消息
     local new_context
@@ -69,8 +196,8 @@ update_context() {
             .
         end
     ')
-    
-    echo "$new_context" > "$CONTEXT_FILE"
+
+    echo "$new_context" > "$context_file"
 }
 
 # 显示加载动画
@@ -179,14 +306,47 @@ clean_command() {
 # 主逻辑
 main() {
     check_dependencies
+    init_config
+
+    # 处理子命令
+    if [ $# -gt 0 ]; then
+        case "$1" in
+            session)
+                if [ -z "$2" ]; then
+                    echo "用法: $0 session <session_name>"
+                    exit 1
+                fi
+                local session_name="$2"
+                # 切换到指定session
+                set_session "$session_name"
+                # 确保session文件存在
+                init_context
+                printf "已切换到session: \033[32m%s\033[0m\n" "$session_name"
+                exit 0
+                ;;
+            list)
+                list_sessions
+                exit 0
+                ;;
+            delete)
+                delete_session
+                exit 0
+                ;;
+        esac
+    fi
+
     init_context
-    
+
     local user_input
     user_input=$(get_user_input "$@")
 
+    local session_name
+    session_name=$(get_current_session)
+    local context_file="$SESSION_DIR/${session_name}.json"
+
     # 检查是否为清理命令
     if [[ "$user_input" == "clear" ]]; then
-        rm -f "$CONTEXT_FILE"
+        rm -f "$context_file"
         echo "上下文已清理。"
         exit 0
     fi
@@ -196,7 +356,7 @@ main() {
     
     # 读取最新上下文用于 API 调用
     local current_context
-    current_context=$(cat "$CONTEXT_FILE")
+    current_context=$(cat "$context_file")
     
     # 调用 API
     local api_response
