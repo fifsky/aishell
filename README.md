@@ -136,11 +136,11 @@ ai delete
 ```bash
 # 在项目 A 的 session 中工作
 ai session project-a
-ai 查找所有的 JavaScript 文件
+ai 查找所有的JavaScript文件
 
 # 切换到项目 B 的 session，完全独立的上下文
 ai session project-b
-ai 查看当前的 Git 状态
+ai 查看当前的Git状态
 
 # 列出所有 session
 ai list
