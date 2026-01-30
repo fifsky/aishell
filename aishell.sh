@@ -217,9 +217,10 @@ main() {
     echo "生成的命令:"
     echo -e "\033[32m$clean_cmd\033[0m"
 
-    read -p "是否执行该命令? (y/n): " execute_confirm
+    read -p "是否执行该命令? (Y/n): " execute_confirm
 
-    if [[ "$execute_confirm" =~ ^[Yy]$ ]]; then
+    # 默认回车为 y
+    if [[ -z "$execute_confirm" || "$execute_confirm" =~ ^[Yy]$ ]]; then
         echo "正在执行..."
         
         # 捕获命令输出（同时捕获 stdout 和 stderr）
