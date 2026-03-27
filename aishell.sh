@@ -241,13 +241,21 @@ trap cleanup SIGINT SIGTERM
 call_api() {
     local context="$1"
     
+    # 判断是否为 qwen 模型，使用不同的参数格式关闭思考
+    local extra_params="{}"
+    if [[ "$MODEL" == qwen* ]]; then
+        extra_params='{"enable_thinking": false}'
+    else
+        extra_params='{"thinking": {"type": "disabled"}}'
+    fi
+    
     # 准备 curl 请求数据
     local request_data
     request_data=$(jq -n \
         --arg model "$MODEL" \
         --argjson messages "$context" \
-        --arg enable_thinking "$ENABLE_THINKING" \
-        '{model: $model, messages: $messages} + (if $enable_thinking == "false" then {thinking: {type: "disabled"}} else {} end)')
+        --argjson extra "$extra_params" \
+        '{model: $model, messages: $messages} + $extra')
 
     start_spinner
 
@@ -361,10 +369,16 @@ main() {
     # 调用 API
     local api_response
     api_response=$(call_api "$current_context")
+    if [ $? -ne 0 ]; then
+        exit 1
+    fi
     
     # 解析响应
     local ai_content
     ai_content=$(parse_response "$api_response")
+    if [ $? -ne 0 ]; then
+        exit 1
+    fi
     
     # 清理命令
     local clean_cmd
