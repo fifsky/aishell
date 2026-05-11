@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # 配置信息
-API_URL="${AISHELL_BASE_URL:-https://api.moonshot.cn/v1/chat/completions}"
+API_URL="${AISHELL_BASE_URL:-https://aiproxy.fifsky.com/v1/chat/completions}"
 API_KEY="${AISHELL_API_KEY}"
-MODEL="${AISHELL_MODEL:-kimi-k2.5}"
+MODEL="${AISHELL_MODEL:-deepseek-v4-flash}"
 MAX_CONTEXT_SIZE="${AISHELL_MAX_CONTEXT:-100}"
 ENABLE_THINKING="false"
 BASE_DIR="$HOME/.aishell"
