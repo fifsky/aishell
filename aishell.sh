@@ -3,24 +3,55 @@
 # 配置信息
 API_URL="${AISHELL_BASE_URL:-https://aiproxy.fifsky.com/v1/chat/completions}"
 API_KEY="${AISHELL_API_KEY}"
-MODEL="${AISHELL_MODEL:-deepseek-v4-flash}"
+MODEL="${AISHELL_MODEL:-deepseek-v4-pro}"
 MAX_CONTEXT_SIZE="${AISHELL_MAX_CONTEXT:-100}"
-ENABLE_THINKING="false"
+MAX_STEPS="${AISHELL_MAX_STEPS:-5}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SYSTEM_PROMPT_FILE="${AISHELL_SYSTEM_PROMPT_FILE:-$SCRIPT_DIR/system_prompt.md}"
+AUTO_APPROVE_COMMAND_PREFIXES=(
+    "tvly search "
+)
 BASE_DIR="$HOME/.aishell"
 SESSION_DIR="$BASE_DIR/sessions"
 CONFIG_FILE="$BASE_DIR/config.json"
-SYSTEM_PROMPT="你是一个shell命令生成器，根据用户的需求生成对应的shell命令，不要输出其他内容"
+SYSTEM_PROMPT=""
+STREAM_FILTER_IN_EXEC=0
+STREAM_FILTER_BUFFER=""
 
 # 检查依赖
 check_dependencies() {
+    if ! command -v curl &> /dev/null; then
+        echo "错误: 未找到 curl 命令。请先安装 curl。"
+        exit 1
+    fi
+
     if ! command -v jq &> /dev/null; then
         echo "错误: 未找到 jq 命令。请先安装 jq。"
+        exit 1
+    fi
+
+    if ! command -v sd &> /dev/null; then
+        echo "错误: 未找到 Streamdown sd 命令。请先安装 Streamdown。"
         exit 1
     fi
 
     if [ -z "$API_KEY" ]; then
         echo "错误: 未找到 API 密钥。请设置 AISHELL_API_KEY 环境变量。"
         echo "例如: export AISHELL_API_KEY='your_api_key'"
+        exit 1
+    fi
+}
+
+load_system_prompt() {
+    if [ ! -f "$SYSTEM_PROMPT_FILE" ]; then
+        echo "错误: 未找到系统提示词文件: $SYSTEM_PROMPT_FILE"
+        echo "可设置 AISHELL_SYSTEM_PROMPT_FILE 指向自定义提示词文件。"
+        exit 1
+    fi
+
+    SYSTEM_PROMPT=$(cat "$SYSTEM_PROMPT_FILE")
+    if [ -z "$SYSTEM_PROMPT" ]; then
+        echo "错误: 系统提示词文件为空: $SYSTEM_PROMPT_FILE"
         exit 1
     fi
 }
@@ -159,6 +190,18 @@ init_context() {
     if [ ! -f "$context_file" ]; then
         # 如果文件不存在，创建一个包含系统提示词的初始 JSON 数组
         jq -n --arg content "$SYSTEM_PROMPT" '[{"role": "system", "content": $content}]' > "$context_file"
+    else
+        local updated_context
+        updated_context=$(jq --arg content "$SYSTEM_PROMPT" '
+            if length == 0 then
+                [{"role": "system", "content": $content}]
+            elif .[0].role == "system" then
+                .[0].content = $content
+            else
+                [{"role": "system", "content": $content}] + .
+            end
+        ' "$context_file")
+        echo "$updated_context" > "$context_file"
     fi
 }
 
@@ -200,47 +243,79 @@ update_context() {
     echo "$new_context" > "$context_file"
 }
 
-# 显示加载动画
-start_spinner() {
-    # 隐藏光标
-    printf "\033[?25l" >&2
-    (
-        local delay=0.08
-        local frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
-        while :; do
-            for frame in "${frames[@]}"; do
-                printf "\r \033[36m%s\033[0m 正在思考中..." "$frame" >&2
-                sleep $delay
-            done
-        done
-    ) &
-    SPINNER_PID=$!
-}
-
-stop_spinner() {
-    if [ -n "$SPINNER_PID" ]; then
-        kill "$SPINNER_PID" >/dev/null 2>&1
-        wait "$SPINNER_PID" >/dev/null 2>&1
-        # 清除行并恢复光标
-        printf "\r%s\r" "                       " >&2
-        printf "\033[?25h" >&2
-        SPINNER_PID=""
-    fi
-}
-
 # 信号捕获：退出时恢复光标
 cleanup() {
-    stop_spinner
     printf "\033[?25h" >&2
     exit
 }
 trap cleanup SIGINT SIGTERM
 
-# 调用 API 获取回复
-# 参数: 上下文 JSON 内容
-call_api() {
+# 去除 AI 回复中的执行协议块，仅保留可渲染给用户看的 Markdown。
+strip_exec_blocks() {
+    local input_file="$1"
+    awk '
+        /^[[:space:]]*```shell-exec[[:space:]]*$/ { in_exec = 1; next }
+        in_exec && /^[[:space:]]*```[[:space:]]*$/ { in_exec = 0; next }
+        !in_exec { print }
+    ' "$input_file"
+}
+
+# 提取第一个 shell-exec 代码块中的命令。
+extract_exec_command() {
+    local input_file="$1"
+    awk '
+        /^[[:space:]]*```shell-exec[[:space:]]*$/ && !done { in_exec = 1; done = 1; next }
+        in_exec && /^[[:space:]]*```[[:space:]]*$/ { exit }
+        in_exec { print }
+    ' "$input_file"
+}
+
+stream_visible_line() {
+    local line="$1"
+
+    if [ "$STREAM_FILTER_IN_EXEC" -eq 0 ] && [[ "$line" =~ ^[[:space:]]*\`\`\`shell-exec[[:space:]]*$ ]]; then
+        STREAM_FILTER_IN_EXEC=1
+        return
+    fi
+
+    if [ "$STREAM_FILTER_IN_EXEC" -eq 1 ]; then
+        if [[ "$line" =~ ^[[:space:]]*\`\`\`[[:space:]]*$ ]]; then
+            STREAM_FILTER_IN_EXEC=0
+        fi
+        return
+    fi
+
+    printf "%s\n" "$line" >&3
+}
+
+stream_visible_delta() {
+    local delta_file="$1"
+    local char
+
+    while IFS= read -r -n 1 char || [ -n "$char" ]; do
+        if [ -z "$char" ]; then
+            stream_visible_line "$STREAM_FILTER_BUFFER"
+            STREAM_FILTER_BUFFER=""
+        else
+            STREAM_FILTER_BUFFER="${STREAM_FILTER_BUFFER}${char}"
+        fi
+    done < "$delta_file"
+}
+
+flush_visible_stream() {
+    if [ -n "$STREAM_FILTER_BUFFER" ]; then
+        stream_visible_line "$STREAM_FILTER_BUFFER"
+        STREAM_FILTER_BUFFER=""
+    fi
+}
+
+# 调用 API，将可见 Markdown 通过管道交给 Streamdown 渲染，并保存完整 AI 回复。
+# 参数 1: 上下文 JSON 内容
+# 参数 2: 保存完整 AI 回复的文件
+call_api_stream() {
     local context="$1"
-    
+    local output_file="$2"
+
     # 判断是否为 qwen 模型，使用不同的参数格式关闭思考
     local extra_params="{}"
     if [[ "$MODEL" == qwen* ]]; then
@@ -248,73 +323,172 @@ call_api() {
     else
         extra_params='{"thinking": {"type": "disabled"}}'
     fi
-    
-    # 准备 curl 请求数据
+
     local request_data
     request_data=$(jq -n \
         --arg model "$MODEL" \
         --argjson messages "$context" \
         --argjson extra "$extra_params" \
-        '{model: $model, messages: $messages} + $extra')
+        '{model: $model, messages: $messages, stream: true} + $extra')
 
-    start_spinner
+    : > "$output_file"
+    STREAM_FILTER_IN_EXEC=0
+    STREAM_FILTER_BUFFER=""
 
-    # 调用 API
-    local response
-    response=$(curl -s "$API_URL" \
+    local pipe
+    pipe=$(mktemp -u "${TMPDIR:-/tmp}/aishell_stream.XXXXXX")
+    if ! mkfifo "$pipe"; then
+        echo "错误: 无法创建流式输出管道。" >&2
+        return 1
+    fi
+
+    local render_pipe
+    render_pipe=$(mktemp -u "${TMPDIR:-/tmp}/aishell_render.XXXXXX")
+    if ! mkfifo "$render_pipe"; then
+        rm -f "$pipe"
+        echo "错误: 无法创建流式渲染管道。" >&2
+        return 1
+    fi
+
+    if [ -t 1 ]; then
+        sd < "$render_pipe" &
+    else
+        sd < "$render_pipe" 2>/dev/null &
+    fi
+    local sd_pid=$!
+    exec 3>"$render_pipe"
+
+    curl -sS -N "$API_URL" \
       -H "Authorization: Bearer $API_KEY" \
       -H "Content-Type: application/json" \
-      -d "$request_data")
-      
-    local curl_exit_code=$?
-    stop_spinner
+      -d "$request_data" > "$pipe" &
 
-    # 检查 curl 是否成功
+    local curl_pid=$!
+    local stream_error=""
+    local line
+    while IFS= read -r line; do
+        case "$line" in
+            data:*)
+                local data
+                data="${line#data:}"
+                data="${data# }"
+                data="${data%$'\r'}"
+                ;;
+            *)
+                continue
+                ;;
+        esac
+
+        if [ "$data" = "[DONE]" ]; then
+            continue
+        fi
+
+        local error_msg
+        error_msg=$(printf "%s" "$data" | jq -r '.error.message // empty' 2>/dev/null)
+        if [ -n "$error_msg" ]; then
+            stream_error="$error_msg"
+            continue
+        fi
+
+        local delta_file
+        delta_file=$(mktemp)
+        printf "%s" "$data" | jq -rj '.choices[0].delta.content // .choices[0].message.content // empty' 2>/dev/null > "$delta_file"
+        if [ -s "$delta_file" ]; then
+            cat "$delta_file" >> "$output_file"
+            stream_visible_delta "$delta_file"
+        fi
+        rm -f "$delta_file"
+    done < "$pipe"
+
+    flush_visible_stream
+    exec 3>&-
+
+    wait "$curl_pid"
+    local curl_exit_code=$?
+    wait "$sd_pid"
+    rm -f "$pipe"
+    rm -f "$render_pipe"
+
     if [ $curl_exit_code -ne 0 ]; then
         echo "错误: API 请求失败。" >&2
-        exit 1
+        return 1
     fi
-    
-    echo "$response"
+
+    if [ -n "$stream_error" ]; then
+        echo "API 错误: $stream_error" >&2
+        return 1
+    fi
+
+    if [ ! -s "$output_file" ]; then
+        echo "错误: 未能获取 AI 回复，接口可能未返回 OpenAI 兼容的流式数据。" >&2
+        return 1
+    fi
+
+    printf "\n"
+
+    return 0
 }
 
-# 解析 API 响应
-# 参数: API 响应 JSON
-parse_response() {
-    local response="$1"
-    
-    # 检查 API 返回是否有错误
-    local error_msg
-    error_msg=$(echo "$response" | jq -r '.error.message // empty')
-    if [ -n "$error_msg" ]; then
-        echo "API 错误: $error_msg" >&2
-        exit 1
-    fi
-
-    # 提取 AI 回复的内容
-    local ai_content
-    ai_content=$(echo "$response" | jq -r '.choices[0].message.content // empty')
-
-    if [ -z "$ai_content" ]; then
-        echo "错误: 未能获取 AI 回复。" >&2
-        echo "调试信息: $response" >&2
-        exit 1
-    fi
-    
-    echo "$ai_content"
+is_blank() {
+    local value="$1"
+    [ -z "$(printf "%s" "$value" | tr -d '[:space:]')" ]
 }
 
-# 清理命令（去除 markdown 标记）
-clean_command() {
-    local content="$1"
-    # 去除可能的 markdown 代码块标记 (```bash ... ``` 或 ``` ...)
-    echo "$content" | sed 's/^```[a-z]*//g' | sed 's/```$//g' | sed 's/`//g' | awk '{$1=$1};1'
+trim_leading_space() {
+    local value="$1"
+    printf "%s" "$value" | sed 's/^[[:space:]]*//'
+}
+
+is_auto_approved_command() {
+    local command_text="$1"
+    local normalized_command
+    local prefix
+
+    normalized_command=$(trim_leading_space "$command_text")
+    for prefix in "${AUTO_APPROVE_COMMAND_PREFIXES[@]}"; do
+        if [[ "$normalized_command" == "$prefix"* ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+execute_shell_command() {
+    local command_text="$1"
+    local output_file
+    output_file=$(mktemp)
+
+    echo "正在执行..."
+    eval "$command_text" > "$output_file" 2>&1
+    local exit_code=$?
+
+    cat "$output_file"
+
+    local cmd_output
+    cmd_output=$(cat "$output_file")
+    rm -f "$output_file"
+
+    local feedback_msg
+    if [ $exit_code -eq 0 ]; then
+        feedback_msg=$(printf "命令执行成功，退出码 0，输出如下：\n%s" "$cmd_output")
+    else
+        feedback_msg=$(printf "命令执行失败，退出码 %s，输出如下：\n%s" "$exit_code" "$cmd_output")
+    fi
+
+    update_context "user" "$feedback_msg"
 }
 
 # 主逻辑
 main() {
     check_dependencies
+    load_system_prompt
     init_config
+
+    if ! [[ "$MAX_STEPS" =~ ^[0-9]+$ ]] || [ "$MAX_STEPS" -lt 1 ]; then
+        echo "错误: AISHELL_MAX_STEPS 必须是大于 0 的整数。"
+        exit 1
+    fi
 
     # 处理子命令
     if [ $# -gt 0 ]; then
@@ -361,70 +535,58 @@ main() {
     
     # 添加用户消息到上下文
     update_context "user" "$user_input"
-    
-    # 读取最新上下文用于 API 调用
-    local current_context
-    current_context=$(cat "$context_file")
-    
-    # 调用 API
-    local api_response
-    api_response=$(call_api "$current_context")
-    if [ $? -ne 0 ]; then
-        exit 1
-    fi
-    
-    # 解析响应
-    local ai_content
-    ai_content=$(parse_response "$api_response")
-    if [ $? -ne 0 ]; then
-        exit 1
-    fi
-    
-    # 清理命令
-    local clean_cmd
-    clean_cmd=$(clean_command "$ai_content")
-    
-    # 更新上下文（保存 AI 回复）
-    update_context "assistant" "$ai_content"
-    
-    # 输出命令并询问执行
-    echo "生成的命令:"
-    echo -e "\033[32m$clean_cmd\033[0m"
 
-    read -p "是否执行该命令? (Y/n): " execute_confirm
+    local step
+    for ((step = 1; step <= MAX_STEPS; step++)); do
+        local current_context
+        current_context=$(cat "$context_file")
 
-    # 默认回车为 y
-    if [[ -z "$execute_confirm" || "$execute_confirm" =~ ^[Yy]$ ]]; then
-        echo "正在执行..."
-        
-        # 捕获命令输出（同时捕获 stdout 和 stderr）
-        # 使用临时文件来保存输出，避免管道导致的子 shell 问题或复杂的转义问题
-        local output_file
-        output_file=$(mktemp)
-        
-        eval "$clean_cmd" > "$output_file" 2>&1
-        local exit_code=$?
-        
-        # 显示输出到终端
-        cat "$output_file"
-        
-        # 读取输出内容
-        local cmd_output
-        cmd_output=$(cat "$output_file")
-        rm "$output_file"
-        
-        # 构建反馈给 AI 的消息
-        local feedback_msg
-        if [ $exit_code -eq 0 ]; then
-            feedback_msg="命令执行成功，输出如下：\n$cmd_output"
-        else
-            feedback_msg="命令执行失败 (退出码 $exit_code)，错误输出如下：\n$cmd_output"
+        local ai_output_file
+        ai_output_file=$(mktemp)
+
+        if ! call_api_stream "$current_context" "$ai_output_file"; then
+            rm -f "$ai_output_file"
+            exit 1
         fi
-        
-        # 将执行结果添加到上下文
-        update_context "user" "$feedback_msg"
-    else
-        echo "已取消执行。"
+
+        local ai_content
+        ai_content=$(cat "$ai_output_file")
+        update_context "assistant" "$ai_content"
+
+        local exec_cmd
+        exec_cmd=$(extract_exec_command "$ai_output_file")
+
+        rm -f "$ai_output_file"
+
+        if is_blank "$exec_cmd"; then
+            break
+        fi
+
+        printf "\n\033[33m需要执行的命令:\033[0m\n"
+        printf "\033[32m%s\033[0m\n" "$exec_cmd"
+
+        if is_auto_approved_command "$exec_cmd"; then
+            echo "命中白名单，自动执行。"
+            execute_shell_command "$exec_cmd"
+        else
+            local execute_confirm
+            if ! read -p "是否执行该命令? (Y/n): " execute_confirm; then
+                echo "未收到确认，已取消执行。"
+                update_context "user" "未收到用户确认，上一条命令没有执行。请在不执行该命令的前提下继续回答，或提供更安全的替代方案。"
+                continue
+            fi
+
+            if [[ -z "$execute_confirm" || "$execute_confirm" =~ ^[Yy]$ ]]; then
+                execute_shell_command "$exec_cmd"
+            else
+                echo "已取消执行。"
+                update_context "user" "用户拒绝执行上一条命令。请在不执行该命令的前提下继续回答，或提供更安全的替代方案。"
+            fi
+        fi
+    done
+
+    if [ "$step" -gt "$MAX_STEPS" ]; then
+        echo "已达到最大自动处理轮数 (${MAX_STEPS})，如需继续请再次输入你的需求。"
     fi
 }
 

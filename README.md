@@ -1,38 +1,47 @@
 # AI Shell 助手 (aishell)
 
-一个基于 AI 的智能终端命令生成工具，能够将自然语言转换为 Shell 命令并辅助执行。
+一个基于 AI 的智能终端助手，能够自动判断用户问题是直接回答、规划步骤，还是需要执行 Shell 命令辅助完成。
 
 ## 功能特性
 
-- 🗣️ **自然语言交互**：直接描述你的需求，自动生成对应的 Shell 命令。
+- 🗣️ **自然语言交互**：直接描述你的需求，AI 会自主判断是直接回答还是需要终端操作。
+- 🧭 **自主规划**：复杂任务会按步骤推进，只有需要执行 Shell 命令时才请求确认。
+- 🌊 **流式渲染**：使用流式接口接收 AI 回复，并通过 Streamdown 实时渲染 Markdown。
+- 📝 **Markdown 渲染**：使用 `sd` 渲染 AI 的 Markdown 回复。
+- 🔎 **联网搜索**：需要搜索当前信息时可通过 Tavily CLI (`tvly search`) 自动检索。
 - 🧠 **智能上下文**：自动记录对话历史，支持多轮对话，能够理解之前的操作结果。
 - 🔄 **执行反馈**：命令执行的输出（标准输出和错误）会自动反馈给 AI，以便进行后续的错误修正或进一步操作。
-- 🛡️ **安全执行**：生成的命令在执行前需要用户确认，防止误操作。
+- 🛡️ **安全执行**：只有 AI 明确请求执行命令时才会提示确认，防止误操作。
 - 📁 **Session 管理**：支持多会话管理，可在不同项目/任务间切换上下文。
 - 🧹 **一键重置**：支持 `clear` 命令快速清理对话上下文。
-- ⚙️ **可配置**：支持开启/关闭 AI 思考模式 (Thinking Mode)。
+- ⚙️ **可配置**：支持配置模型、接口地址、上下文长度和自动处理轮数。
 
 ## 依赖要求
 
 - `bash`
 - `curl`
 - `jq` (用于处理 JSON 数据)
+- `sd` (Streamdown，用于流式渲染 Markdown 输出)
+- `tvly` (可选，用于联网搜索)
 - `fzf` (可选，用于 Session 列表选择和删除功能)
 
 macOS 安装依赖:
 
 ```bash
-brew install jq fzf
+brew install jq streamdown fzf
 ```
+
+`tvly` 请按 Tavily CLI 官方方式安装并登录。
 
 ## 安装与配置
 
 ### 1. 下载与授权
 
-使用 wget 下载脚本到本地（例如 `~/aishell.sh`）：
+使用 wget 下载脚本和提示词到本地（例如放在 `~` 目录）：
 
 ```bash
 wget -O ~/aishell.sh https://raw.githubusercontent.com/fifsky/aishell/refs/heads/main/aishell.sh
+wget -O ~/system_prompt.md https://raw.githubusercontent.com/fifsky/aishell/refs/heads/main/system_prompt.md
 ```
 
 赋予执行权限：
@@ -53,14 +62,20 @@ chmod +x ~/aishell.sh
 # 必填：配置 API 密钥
 export AISHELL_API_KEY="sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
-# 选填：配置 API 接口地址 (默认为 Moonshot AI 地址)
-# export AISHELL_BASE_URL="https://api.moonshot.cn/v1/chat/completions"
+# 选填：配置 API 接口地址
+# export AISHELL_BASE_URL="https://aiproxy.fifsky.com/v1/chat/completions"
 
-# 选填：配置模型 (默认为 kimi-k2.5)
-# export AISHELL_MODEL="kimi-k2.5"
+# 选填：配置模型
+# export AISHELL_MODEL="deepseek-v4-flash"
 
 # 选填：配置上下文保留条数 (默认为 100)
 # export AISHELL_MAX_CONTEXT=100
+
+# 选填：配置单次请求内最多自动处理轮数 (默认为 5)
+# export AISHELL_MAX_STEPS=5
+
+# 选填：配置系统提示词文件
+# export AISHELL_SYSTEM_PROMPT_FILE="${HOME}/system_prompt.md"
 
 # 选填：配置别名
 alias ai="${HOME}/aishell.sh"
@@ -84,6 +99,16 @@ source ~/.zshrc
 ai "查看当前目录下的所有 PDF 文件"
 ```
 
+如果 AI 需要查看本机目录，会先给出说明和待执行命令，并等待你确认；如果只是知识性问题，则会直接回答。
+
+```bash
+ai "tar 和 gzip 有什么区别"
+```
+
+需要执行命令时，AI 必须输出 `shell-exec` 代码块；普通 `bash`、`sh`、`shell` 代码块只会作为 Markdown 渲染，不会执行。
+
+`aishell.sh` 顶部的 `AUTO_APPROVE_COMMAND_PREFIXES` 数组定义了自动执行白名单，使用前缀匹配。默认 `tvly search ` 命中白名单，因此搜索命令会自动执行，无需确认。
+
 ### 多轮对话示例
 
 ```bash
@@ -97,7 +122,7 @@ ai 把它们打包成 tar.gz
 ai 解压刚才的包
 ```
 
-> 输入的内容包含特殊字符（如空格），请用引号括起来。或者放入文本文件中使用`cat 文件名 | ai`
+> 输入的内容包含特殊字符（如空格），请用引号括起来。文本文件内容可以使用 `ai "$(cat 文件名)"` 传入。
 
 ### Session 管理
 
@@ -159,7 +184,10 @@ ai clear
 
 ## 高级配置
 
-你可以直接编辑 `aishell.sh` 文件头部变量进行配置：
+你可以直接编辑 `aishell.sh` 文件头部变量进行配置，也可以修改脚本同目录下的 `system_prompt.md` 来调整 AI 行为。
 
-- **ENABLE_THINKING**: 设置为 `"true"` 可开启 AI 的思考过程展示（取决于模型支持）。
-- **MODEL**: 切换使用的模型版本（默认 `kimi-k2.5`）。
+- **API_URL**: 切换 OpenAI 兼容的 Chat Completions 接口地址。
+- **MODEL**: 切换使用的模型版本（默认 `deepseek-v4-flash`）。
+- **MAX_CONTEXT_SIZE**: 控制保留的上下文消息数量（默认 `100`）。
+- **MAX_STEPS**: 控制单次请求内最多自动处理轮数（默认 `5`）。
+- **SYSTEM_PROMPT_FILE**: 控制系统提示词文件路径（默认脚本同目录的 `system_prompt.md`）。
